@@ -1310,7 +1310,7 @@ function lastBlockIsPara(tokens) {
 const LAZY_PREV_RES = [0, 1, 2, 3].map((t) => ({
   fence: new RegExp(`^ {0,${t}}(?:\`\`\`|~~~)`),
   heading: new RegExp(`^ {0,${t}}#{1,6}(?:\\s|$)`),
-  hr: new RegExp(`^ {0,${t}}((?:-[ \\t]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})`),
+  hr: new RegExp(`^ {0,${t}}((?:-[ \\t]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})(?:\\n+|$)`),
   html: new RegExp(`^ {0,${t}}(?:</?(?:${[...BLOCK_TAGS].join('|')})(?: +|$|/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)`, 'i'),
 }));
 function prevBlocksLazy(m, contentIndent) {
@@ -1593,9 +1593,10 @@ function itemStrip(line, want) {
   return ' '.repeat(col - want) + line.slice(i);
 }
 
-// The fence open at the end of a line buffer, if any: while an item's
-// content ends inside an unclosed fence, every following line belongs
-// to the item whatever its indentation.
+// The fence open at the end of a line buffer, if any. Whether a
+// following line then belongs to the item is decided per line in
+// parseList (indented lines are fence content; dedented lines go
+// through the reference's lazy-line test on the previous line).
 const fenceStateCache = new WeakMap();
 function fenceStateAtEnd(buf) {
   // Incremental scan: buffers grow by appends while gathering, so the
@@ -1624,23 +1625,6 @@ function fenceStateAtEnd(buf) {
     states.push(open);
   }
   return states[buf.length];
-}
-
-// The fence-swallow in a list item stops when the fence's last content
-// line (in its raw, pre-strip form) looks like a block start relative
-// to the item: an ATX heading, a rule, a fence or an HTML block whose
-// raw indentation is at most 2*C-1 (C = the item's content indent), or
-// a line indented a full code level (4+) past the content indent.
-function fenceSwallowBlocked(raw, contentIndent) {
-  if (raw === undefined) return false;
-  const ind = leadInfo(raw).cols;
-  if (ind - contentIndent >= 4) return true;
-  if (ind > 2 * contentIndent - 1) return false;
-  const rel = itemStrip(raw, contentIndent);
-  // The reference's stop test is its fencesBegin prefix rule (any run of
-  // three backticks or tildes), not a full fence-start match: a line
-  // like ```n` cannot open a fence, yet still stops the swallow.
-  return !!(matchATX(rel) || isHRLine(rel) || /^(`{3}|~{3})/.test(rel) || htmlBlockType(rel) !== 0);
 }
 
 function parseList(lines, i, defs, ctx) {
@@ -1683,9 +1667,6 @@ function parseList(lines, i, defs, ctx) {
     if (fenceOpen && !isBlankLine(line)) {
       // Inside an unclosed fence, a line with the item's indentation is
       // fence content even when it looks like a list marker or a rule.
-      // Once the fence has swallowed at least one content line, marked
-      // keeps feeding it lines regardless of indentation; before that,
-      // an unindented line ends the item (and the fence stays empty).
       if (leadInfo(line).cols >= cur.contentIndent) {
         cur.buf.push(itemStrip(line, cur.contentIndent));
         cur.rawTail = line;
@@ -1696,18 +1677,20 @@ function parseList(lines, i, defs, ctx) {
       // opens a new fence outside, even when it could have closed
       // the item's open fence. Lines that start a block of their own
       // (heading, rule, HTML block, quote, list marker) likewise end
-      // the item; anything else is swallowed as fence content once
-      // the fence has a content line and its tail does not block.
+      // the item. Any other dedented line is judged by the reference's
+      // one gathering rule for dedented lines, fence or no fence: it
+      // joins the item only when the previous gathered line does not
+      // block laziness (prevBlocksLazy — a fence opener that begins
+      // within the item frame's clamped indent tolerance blocks it, so
+      // the fence stays empty and the line falls outside; an opener
+      // that sits deeper in the frame does not block, and the line
+      // becomes fence content). The reference's gathering tracks no
+      // fence state beyond this per-line test.
       const candBlock = !!(matchATX(line) || isHRLine(line) || htmlBlockType(line) !== 0 ||
         /^[ ]{0,3}>/.test(line) || matchListMarker(line));
-      // A fence that sits indented inside the item (its opening line
-      // keeps indentation in the buffer) also swallows an out-of-item
-      // line as its FIRST content line.
-      const firstContentOk = cur.buf.length - 1 === fenceOpen.startIdx &&
-        leadInfo(cur.buf[fenceOpen.startIdx]).cols >= 1;
       const lineIsRun = leadInfo(line).cols <= 3 && /^[`~]{3,}/.test(line.slice(leadInfo(line).idx));
-      if (!fenceStart(line) && !lineIsRun && !candBlock &&
-          (cur.buf.length - 1 > fenceOpen.startIdx || firstContentOk) && !fenceSwallowBlocked(cur.rawTail, cur.contentIndent)) {
+      const mPrev = cur.buf.length === 1 ? cur.lazyPrev : itemStrip(cur.rawTail, cur.contentIndent);
+      if (!fenceStart(line) && !lineIsRun && !candBlock && !prevBlocksLazy(mPrev, cur.contentIndent)) {
         cur.buf.push(line);
         cur.rawTail = line;
         j++;
